@@ -27,6 +27,7 @@ struct world_t
 	RETRO_BSP *map = NULL;
 	primdesc_t *surfacePrimitives = NULL;
 	texture_t *textures = NULL;
+	lightmap_t *surfaceLightmaps = NULL;
 	int numTextures = 0;
 	visiblesurface_t *sortedVisibleSurfaces = NULL;
 	int numMaxEdgesPerSurface = 0;
@@ -39,6 +40,9 @@ struct world_t
 	vec3_t viewForward;
 	vec3_t viewSide;
 	vec3_t viewUp;
+	unsigned char lightTable[256 * 256];
+	int lightStyles[64];
+	double lightStyleTime = 0.0;
 	double textureTime = 0.0;
 };
 
@@ -82,6 +86,34 @@ int TextureAnimationFrame(const char *name)
 		return name[1] - '0';
 	}
 	return -1;
+}
+
+// Classic Quake light-style brightness patterns. Each character 'a'..'z' is a
+// brightness level ('a' = dark, 'm' = normal, 'z' = bright), cycled at 10 Hz.
+const char *LightStylePattern(int style)
+{
+	static const char *patterns[] = {
+		"m",
+		"mmnmmommommnonmmonqnmmo",
+		"abcdefghijklmnopqrstuvwxyzyxwvutsrqponmlkjihgfedcba",
+		"mmmmmaaaaammmmmaaaaaabcdefgabcdefg",
+		"mamamamamama",
+		"jklmnopqrstuvwxyzyxwvutsrqponmlkj",
+		"nmonqnmomnmomomno",
+		"mmmaaaabcdefgmmmmaaaammmaamm",
+		"mmmaaammmaaammmabcdefaaaammmmabcdefmmmaaaa",
+		"aaaaaaaazzzzzzzz",
+		"mmamammmmammamamaaamammma",
+		"abcdefghijklmnopqrrqponmlkjihgfedcba",
+		"mmnnmmnnnmmnn",
+		"kmjmlnklkj",
+		"mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmaaaaaaaazzzzzzzz",
+	};
+
+	if (style >= 0 && style < (int)(sizeof(patterns) / sizeof(patterns[0]))) {
+		return patterns[style];
+	}
+	return "m";
 }
 
 //
@@ -181,6 +213,53 @@ dleaf_t *FindLeaf(world_t *world, RETRO_Camera *camera)
 	}
 
 	return leaf;
+}
+
+//
+// Build a palette table for applying BSP lightmap brightness to indexed texels
+//
+void BuildLightTable(world_t *world)
+{
+	unsigned char *colormap = world->map->getColormap();
+
+	for (int color = 0; color < 256; color++) {
+		for (int light = 0; light < 256; light++) {
+			// Palette entries 224-255 are fullbright and ignore the lightmap.
+			if (color >= 224) {
+				world->lightTable[color * 256 + light] = (unsigned char)color;
+				continue;
+			}
+			// Brighter light selects a lower (brighter) colormap row.
+			int row = 63 - (light >> 2);
+			if (row < 0) row = 0;
+			if (row > 63) row = 63;
+			world->lightTable[color * 256 + light] = colormap[row * 256 + color];
+		}
+	}
+}
+
+//
+// Advance classic Quake animated light style values
+//
+void UpdateLightStyles(world_t *world, double deltaTime)
+{
+	world->lightStyleTime += deltaTime;
+	int frame = (int)(world->lightStyleTime * 10.0);	// light styles animate at 10 Hz
+
+	for (int style = 0; style < 64; style++) {
+		const char *pattern = LightStylePattern(style);
+		int length = 0;
+		while (pattern[length]) {
+			length++;
+		}
+
+		// Map the current pattern letter 'a'..'z' onto a brightness scale where
+		// 'm' (== 264) is normal full-strength lighting.
+		char value = pattern[length > 0 ? frame % length : 0];
+		if (value < 'a') value = 'a';
+		if (value > 'z') value = 'z';
+		world->lightStyles[style] = ((int)value - (int)'a') * 22;
+	}
 }
 
 //
@@ -351,7 +430,11 @@ void DrawSurface(world_t *world, int surface, const drawcontext_t *ctx)
 	}
 	texture = ResolveTextureAnimation(world, texture);
 
-	int mipLevel = EstimateSurfaceMipLevel(world, primitives, numEdges, texture);
+	// Sky and liquid surfaces are flagged TEX_SPECIAL: they carry no lightmap and are
+	// drawn full-bright and unmipped, rather than relying on lightofs == -1.
+	bool special = (textureInfo->flags & TEX_SPECIAL) != 0;
+	lightmap_t *lightmap = special ? NULL : &world->surfaceLightmaps[surface];
+	int mipLevel = special ? 0 : EstimateSurfaceMipLevel(world, primitives, numEdges, texture);
 
 	// Fan-triangulate the face (BSP faces are convex) and draw each triangle.
 	rendervertex_t first;
@@ -359,16 +442,22 @@ void DrawSurface(world_t *world, int surface, const drawcontext_t *ctx)
 	TransformVertex(world, primitives[0].v, first.v);
 	first.t[0] = primitives[0].t[0];
 	first.t[1] = primitives[0].t[1];
+	first.l[0] = primitives[0].l[0];
+	first.l[1] = primitives[0].l[1];
 	TransformVertex(world, primitives[1].v, previous.v);
 	previous.t[0] = primitives[1].t[0];
 	previous.t[1] = primitives[1].t[1];
+	previous.l[0] = primitives[1].l[0];
+	previous.l[1] = primitives[1].l[1];
 
 	for (int i = 2; i < numEdges; i++) {
 		rendervertex_t current;
 		TransformVertex(world, primitives[i].v, current.v);
 		current.t[0] = primitives[i].t[0];
 		current.t[1] = primitives[i].t[1];
-		DrawTriangle(ctx, first, previous, current, texture, mipLevel, color);
+		current.l[0] = primitives[i].l[0];
+		current.l[1] = primitives[i].l[1];
+		DrawTriangle(ctx, first, previous, current, texture, lightmap, mipLevel, color);
 		previous = current;
 	}
 }
@@ -420,6 +509,7 @@ void DrawLeafVisibleSet(world_t *world, dleaf_t *pLeaf, const drawcontext_t *ctx
 void DrawScene(world_t *world, RETRO_Camera *camera, unsigned char *framebuffer, double deltaTime)
 {
 	world->framebuffer = framebuffer;
+	UpdateLightStyles(world, deltaTime);
 	world->textureTime += deltaTime;
 	ClearBuffers(world);
 
@@ -435,7 +525,12 @@ void DrawScene(world_t *world, RETRO_Camera *camera, unsigned char *framebuffer,
 		world->depthbuffer,
 		world->framebufferWidth,
 		world->framebufferHeight,
-		world->textureTime
+		world->lightTable,
+		world->lightStyles,
+		world->textureTime,
+		{ 0.0f, 0.0f, 0.0f },
+		{ 0.0f, 0.0f, 0.0f },
+		{ 0.0f, 0.0f, 0.0f }
 	};
 
 	// Render the scene
@@ -553,6 +648,7 @@ bool DecodeSurfaces(world_t *world)
 
 	// Allocate memory for the surface primitive array
 	world->surfacePrimitives = new primdesc_t [world->map->getNumSurfaces() * world->numMaxEdgesPerSurface];
+	world->surfaceLightmaps = new lightmap_t [world->map->getNumSurfaces()];
 
 	// Loop through all surfaces to fetch their vertices and compute texture coords
 	for (int i = 0; i < world->map->getNumSurfaces(); i++) {
@@ -569,6 +665,10 @@ bool DecodeSurfaces(world_t *world)
 
 		// Point to a surface primitive array
 		primdesc_t *primitives = &world->surfacePrimitives[i * world->numMaxEdgesPerSurface];
+		float minS = FLT_MAX;
+		float minT = FLT_MAX;
+		float maxS = -FLT_MAX;
+		float maxT = -FLT_MAX;
 
 		for (int j = 0; j < numEdges; j++, primitives++) {
 			// Get an edge id from the surface. Fetch the correct edge by using the id in the Edge List.
@@ -590,6 +690,42 @@ bool DecodeSurfaces(world_t *world)
 			primitives->t[1] = t / texHeight;
 			primitives->l[0] = s;
 			primitives->l[1] = t;
+
+			if (s < minS) minS = s;
+			if (t < minT) minT = t;
+			if (s > maxS) maxS = s;
+			if (t > maxT) maxT = t;
+		}
+
+		// The lightmap spans the surface's texture-space bounds at one luxel per 16 texels.
+		int lightMinS = FloorDiv16(minS);
+		int lightMinT = FloorDiv16(minT);
+		int lightMaxS = CeilDiv16(maxS);
+		int lightMaxT = CeilDiv16(maxT);
+		world->surfaceLightmaps[i].width = lightMaxS - lightMinS + 1;
+		world->surfaceLightmaps[i].height = lightMaxT - lightMinT + 1;
+		world->surfaceLightmaps[i].numStyles = 0;
+		for (int style = 0; style < MAXLIGHTMAPS; style++) {
+			world->surfaceLightmaps[i].styles[style] = 255;
+			world->surfaceLightmaps[i].samples[style] = NULL;
+		}
+
+		// Point each active light style at its block of samples (styles[] ends at 0xFF).
+		int lightmapSize = world->surfaceLightmaps[i].width * world->surfaceLightmaps[i].height;
+		unsigned char *lightmap = world->map->getLightmap(surface->lightofs);
+		if (lightmap) {
+			for (int style = 0; style < MAXLIGHTMAPS && surface->styles[style] != 255; style++) {
+				world->surfaceLightmaps[i].styles[style] = surface->styles[style];
+				world->surfaceLightmaps[i].samples[style] = lightmap + style * lightmapSize;
+				world->surfaceLightmaps[i].numStyles++;
+			}
+		}
+
+		// Convert the stored texel coords into luxel coords local to this lightmap.
+		primitives = &world->surfacePrimitives[i * world->numMaxEdgesPerSurface];
+		for (int j = 0; j < numEdges; j++, primitives++) {
+			primitives->l[0] = (primitives->l[0] - (float)(lightMinS * 16)) / 16.0f;
+			primitives->l[1] = (primitives->l[1] - (float)(lightMinT * 16)) / 16.0f;
 		}
 	}
 
@@ -622,6 +758,8 @@ void DEMO_Initialize(void)
 	world.framebufferHeight = RETRO_HEIGHT;
 	world.depthbuffer = new float [world.framebufferWidth * world.framebufferHeight];
 	world.frustumRatio = (float)RETRO_HEIGHT / (float)RETRO_WIDTH;
+	BuildLightTable(&world);
+	UpdateLightStyles(&world, 0.0);
 
 	if (!DecodeTextures(&world)) {
 		RETRO_RageQuit("[ERROR] Quake::DEMO_Initialize() Unable to decode world textures\n");
@@ -651,6 +789,7 @@ void DEMO_Deinitialize(void)
 		delete[] world.textures;
 	}
 	if (world.sortedVisibleSurfaces) delete[] world.sortedVisibleSurfaces;
+	if (world.surfaceLightmaps) delete[] world.surfaceLightmaps;
 	if (world.depthbuffer) delete[] world.depthbuffer;
 }
 
