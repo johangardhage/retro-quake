@@ -26,6 +26,8 @@ struct world_t
 {
 	RETRO_BSP *map = NULL;
 	primdesc_t *surfacePrimitives = NULL;
+	texture_t *textures = NULL;
+	int numTextures = 0;
 	visiblesurface_t *sortedVisibleSurfaces = NULL;
 	int numMaxEdgesPerSurface = 0;
 	int framebufferWidth = 0;
@@ -37,6 +39,7 @@ struct world_t
 	vec3_t viewForward;
 	vec3_t viewSide;
 	vec3_t viewUp;
+	double textureTime = 0.0;
 };
 
 world_t world;
@@ -49,6 +52,36 @@ unsigned char SurfaceColor(int surface)
 {
 	unsigned int hash = (unsigned int)surface * 1103515245u + 12345u;
 	return 32 + ((hash >> 8) & 0x7f);
+}
+
+// True if two "+" animated texture names belong to the same sequence
+// (identical past the leading "+N" frame marker)
+bool IsSameTextureAnimation(const char *a, const char *b)
+{
+	if (!a || !b || a[0] != '+' || b[0] != '+') {
+		return false;
+	}
+	for (int i = 2; i < 16; i++) {
+		if (a[i] != b[i]) {
+			return false;
+		}
+		if (a[i] == '\0') {
+			return true;
+		}
+	}
+	return true;
+}
+
+// Frame number 0-9 of a "+N..." animated texture, or -1 if it is not animated
+int TextureAnimationFrame(const char *name)
+{
+	if (!name || name[0] != '+') {
+		return -1;
+	}
+	if (name[1] >= '0' && name[1] <= '9') {
+		return name[1] - '0';
+	}
+	return -1;
 }
 
 //
@@ -220,29 +253,122 @@ void SortVisibleSurfaces(visiblesurface_t *surfaces, int numSurfaces)
 }
 
 //
+// Estimate one stable mip level for a whole BSP surface
+//
+int EstimateSurfaceMipLevel(world_t *world, primdesc_t *primitives, int numEdges, texture_t *texture)
+{
+	const float nearPlane = 1.0f;
+	if (!texture || !texture->levels || texture->numLevels <= 1 || numEdges < 2) {
+		return 0;
+	}
+
+	// Find the worst-case texture density (texels per screen pixel) along the
+	// surface edges, then pick the mip level that matches it.
+	float maxTexelsPerPixel = 1.0f;
+	for (int i = 0; i < numEdges; i++) {
+		primdesc_t *a = &primitives[i];
+		primdesc_t *b = &primitives[(i + 1) % numEdges];
+		float clipA[4];
+		float clipB[4];
+		TransformVertex(world, a->v, clipA);
+		TransformVertex(world, b->v, clipB);
+
+		if (clipA[3] < nearPlane || clipB[3] < nearPlane) {
+			continue;
+		}
+
+		float invWA = 1.0f / clipA[3];
+		float invWB = 1.0f / clipB[3];
+		float ax = (clipA[0] * invWA * 0.5f + 0.5f) * (float)(world->framebufferWidth - 1);
+		float ay = (0.5f - clipA[1] * invWA * 0.5f) * (float)(world->framebufferHeight - 1);
+		float bx = (clipB[0] * invWB * 0.5f + 0.5f) * (float)(world->framebufferWidth - 1);
+		float by = (0.5f - clipB[1] * invWB * 0.5f) * (float)(world->framebufferHeight - 1);
+		float dx = bx - ax;
+		float dy = by - ay;
+		float screenLength = sqrtf(dx * dx + dy * dy);
+		if (screenLength < 1.0f) {
+			continue;
+		}
+
+		float du = (b->t[0] - a->t[0]) * (float)texture->levels[0].width;
+		float dv = (b->t[1] - a->t[1]) * (float)texture->levels[0].height;
+		float texelLength = sqrtf(du * du + dv * dv);
+		float texelsPerPixel = texelLength / screenLength;
+		if (texelsPerPixel > maxTexelsPerPixel) {
+			maxTexelsPerPixel = texelsPerPixel;
+		}
+	}
+
+	// Each mip step halves resolution, so the level is log2 of the density.
+	int level = (int)floorf(log2f(maxTexelsPerPixel));
+	if (level < 0) {
+		level = 0;
+	} else if (level >= texture->numLevels) {
+		level = texture->numLevels - 1;
+	}
+	return level;
+}
+
+//
+// Resolve a BSP texture animation frame for this render time
+//
+texture_t *ResolveTextureAnimation(world_t *world, texture_t *texture)
+{
+	if (!texture || texture->animTotal <= 1) {
+		return texture;
+	}
+
+	// Quake animates textures at 10 frames per second
+	int frame = ((int)(world->textureTime * 10.0)) % texture->animTotal;
+	int textureIndex = texture->animFrames[frame];
+	if (textureIndex < 0) {
+		textureIndex = texture->animFrames[0];
+	}
+	if (textureIndex < 0 || textureIndex >= world->numTextures) {
+		return texture;
+	}
+	return &world->textures[textureIndex];
+}
+
+//
 // Draw the surface
 //
 void DrawSurface(world_t *world, int surface, const drawcontext_t *ctx)
 {
 	// Get the surface primitive
 	primdesc_t *primitives = &world->surfacePrimitives[world->numMaxEdgesPerSurface * surface];
+	texinfo_t *textureInfo = world->map->getTextureInfo(surface);
+	texture_t *texture = NULL;
 	int numEdges = world->map->getNumEdges(surface);
-	unsigned char color = SurfaceColor(surface);
+	unsigned char color = SurfaceColor(textureInfo->miptex);
 
 	if (numEdges < 3) {
 		return;
 	}
 
+	if (textureInfo->miptex >= 0 && textureInfo->miptex < world->numTextures && world->textures[textureInfo->miptex].levels) {
+		texture = &world->textures[textureInfo->miptex];
+	}
+	texture = ResolveTextureAnimation(world, texture);
+
+	int mipLevel = EstimateSurfaceMipLevel(world, primitives, numEdges, texture);
+
 	// Fan-triangulate the face (BSP faces are convex) and draw each triangle.
 	rendervertex_t first;
 	rendervertex_t previous;
 	TransformVertex(world, primitives[0].v, first.v);
+	first.t[0] = primitives[0].t[0];
+	first.t[1] = primitives[0].t[1];
 	TransformVertex(world, primitives[1].v, previous.v);
+	previous.t[0] = primitives[1].t[0];
+	previous.t[1] = primitives[1].t[1];
 
 	for (int i = 2; i < numEdges; i++) {
 		rendervertex_t current;
 		TransformVertex(world, primitives[i].v, current.v);
-		DrawTriangle(ctx, first, previous, current, color);
+		current.t[0] = primitives[i].t[0];
+		current.t[1] = primitives[i].t[1];
+		DrawTriangle(ctx, first, previous, current, texture, mipLevel, color);
 		previous = current;
 	}
 }
@@ -294,6 +420,7 @@ void DrawLeafVisibleSet(world_t *world, dleaf_t *pLeaf, const drawcontext_t *ctx
 void DrawScene(world_t *world, RETRO_Camera *camera, unsigned char *framebuffer, double deltaTime)
 {
 	world->framebuffer = framebuffer;
+	world->textureTime += deltaTime;
 	ClearBuffers(world);
 
 	// Setup the CPU-side view transform used by DrawSurface.
@@ -307,11 +434,105 @@ void DrawScene(world_t *world, RETRO_Camera *camera, unsigned char *framebuffer,
 		world->framebuffer,
 		world->depthbuffer,
 		world->framebufferWidth,
-		world->framebufferHeight
+		world->framebufferHeight,
+		world->textureTime
 	};
 
 	// Render the scene
 	DrawLeafVisibleSet(world, leaf, &ctx);
+}
+
+//
+// Copy BSP texture data into CPU indexed mipmaps
+//
+bool DecodeTextures(world_t *world)
+{
+	world->numTextures = world->map->getNumTextures();
+	world->textures = new texture_t [world->numTextures];
+
+	// First pass: decode each BSP texture's four mip levels into CPU buffers.
+	for (int i = 0; i < world->numTextures; i++) {
+		miptex_t *mipTexture = world->map->getMipTexture(i);
+
+		world->textures[i].numLevels = 0;
+		world->textures[i].levels = NULL;
+		world->textures[i].isSky = false;
+		world->textures[i].isTurbulent = false;
+		world->textures[i].animTotal = 0;
+		for (int frame = 0; frame < 10; frame++) {
+			world->textures[i].animFrames[frame] = -1;
+		}
+
+		// NULL textures exist, and a zero mip offset means the slot has no texel data.
+		if (!mipTexture || !mipTexture->name[0] || mipTexture->offsets[0] == 0) {
+			continue;
+		}
+
+		int width = mipTexture->width;
+		int height = mipTexture->height;
+		unsigned int mipOffsets[4] = {
+			mipTexture->offsets[0],
+			mipTexture->offsets[1],
+			mipTexture->offsets[2],
+			mipTexture->offsets[3]
+		};
+		int numLevels = 4;
+
+		world->textures[i].numLevels = numLevels;
+		world->textures[i].levels = new miplevel_t [numLevels];
+		for (int level = 0; level < numLevels; level++) {
+			world->textures[i].levels[level].width = 0;
+			world->textures[i].levels[level].height = 0;
+			world->textures[i].levels[level].pixels = NULL;
+		}
+
+		// Copy each mip level (full, 1/2, 1/4, 1/8) out of the BSP into its own buffer.
+		for (int level = 0; level < numLevels; level++) {
+			miplevel_t *current = &world->textures[i].levels[level];
+			current->width = width >> level;
+			current->height = height >> level;
+			if (current->width < 1) current->width = 1;
+			if (current->height < 1) current->height = 1;
+			current->pixels = new unsigned char [current->width * current->height];
+
+			unsigned char *rawTexture = (unsigned char *)mipTexture + mipOffsets[level];
+			for (int y = 0; y < current->height; y++) {
+				for (int x = 0; x < current->width; x++) {
+					current->pixels[x + y * current->width] = rawTexture[x + y * current->width];
+				}
+			}
+		}
+	}
+
+	// Second pass: collect the "+0".."+9" frames of each animation into its "+0" texture.
+	for (int i = 0; i < world->numTextures; i++) {
+		miptex_t *baseTexture = world->map->getMipTexture(i);
+		if (!baseTexture) {
+			continue;
+		}
+		// Only the "+0" texture of a sequence owns the frame list.
+		int baseFrame = TextureAnimationFrame(baseTexture->name);
+		if (baseFrame != 0) {
+			continue;
+		}
+
+		for (int j = 0; j < world->numTextures; j++) {
+			miptex_t *frameTexture = world->map->getMipTexture(j);
+			if (!frameTexture || !IsSameTextureAnimation(baseTexture->name, frameTexture->name)) {
+				continue;
+			}
+
+			int frame = TextureAnimationFrame(frameTexture->name);
+			if (frame >= 0 && frame < 10) {
+				world->textures[i].animFrames[frame] = j;
+				if (frame + 1 > world->textures[i].animTotal) {
+					world->textures[i].animTotal = frame + 1;
+				}
+			}
+		}
+	}
+
+	return true;
 }
 
 //
@@ -333,10 +554,18 @@ bool DecodeSurfaces(world_t *world)
 	// Allocate memory for the surface primitive array
 	world->surfacePrimitives = new primdesc_t [world->map->getNumSurfaces() * world->numMaxEdgesPerSurface];
 
-	// Loop through all surfaces to fetch their vertices
+	// Loop through all surfaces to fetch their vertices and compute texture coords
 	for (int i = 0; i < world->map->getNumSurfaces(); i++) {
 		int numEdges = world->map->getNumEdges(i);
 		dface_t *surface = world->map->getSurface(i);
+
+		// Get a pointer to texinfo for this surface
+		texinfo_t *textureInfo = world->map->getTextureInfo(i);
+		// Get a pointer to the surface's miptextures
+		miptex_t *mipTexture = world->map->getMipTexture(textureInfo->miptex);
+		// Fall back to a unit size when the texture slot has no data (missing texture)
+		float texWidth = (mipTexture && mipTexture->width) ? (float)mipTexture->width : 1.0f;
+		float texHeight = (mipTexture && mipTexture->height) ? (float)mipTexture->height : 1.0f;
 
 		// Point to a surface primitive array
 		primdesc_t *primitives = &world->surfacePrimitives[i * world->numMaxEdgesPerSurface];
@@ -353,6 +582,14 @@ bool DecodeSurfaces(world_t *world)
 			primitives->v[0] = ((float *)vertex)[0];
 			primitives->v[1] = ((float *)vertex)[1];
 			primitives->v[2] = ((float *)vertex)[2];
+
+			// Calculate the vertex's texture coords and store it in the primitive array
+			float s = DotProduct(textureInfo->vecs[0], primitives->v) + textureInfo->vecs[0][3];
+			float t = DotProduct(textureInfo->vecs[1], primitives->v) + textureInfo->vecs[1][3];
+			primitives->t[0] = s / texWidth;
+			primitives->t[1] = t / texHeight;
+			primitives->l[0] = s;
+			primitives->l[1] = t;
 		}
 	}
 
@@ -386,6 +623,10 @@ void DEMO_Initialize(void)
 	world.depthbuffer = new float [world.framebufferWidth * world.framebufferHeight];
 	world.frustumRatio = (float)RETRO_HEIGHT / (float)RETRO_WIDTH;
 
+	if (!DecodeTextures(&world)) {
+		RETRO_RageQuit("[ERROR] Quake::DEMO_Initialize() Unable to decode world textures\n");
+	}
+
 	if (!DecodeSurfaces(&world)) {
 		RETRO_RageQuit("[ERROR] Quake::DEMO_Initialize() Unable to decode world surfaces\n");
 	}
@@ -398,6 +639,17 @@ void DEMO_Deinitialize(void)
 {
 	RETRO_FreeBSP(&map);
 	if (world.surfacePrimitives) delete[] world.surfacePrimitives;
+	if (world.textures) {
+		for (int i = 0; i < world.numTextures; i++) {
+			if (world.textures[i].levels) {
+				for (int j = 0; j < world.textures[i].numLevels; j++) {
+					if (world.textures[i].levels[j].pixels) delete[] world.textures[i].levels[j].pixels;
+				}
+				delete[] world.textures[i].levels;
+			}
+		}
+		delete[] world.textures;
+	}
 	if (world.sortedVisibleSurfaces) delete[] world.sortedVisibleSurfaces;
 	if (world.depthbuffer) delete[] world.depthbuffer;
 }
