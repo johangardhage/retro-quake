@@ -3,9 +3,9 @@
 //
 // Author: Johan Gardhage <johan.gardhage@gmail.com>
 //
-#include <stdio.h>
-#include <math.h>
-#include <float.h>
+#include <stdio.h> // snprintf
+#include <math.h> // cos, sin, fabs, M_PI, sqrtf, log2f, floorf, ceilf
+#include <float.h> // FLT_MAX
 #include "lib/retro.h"
 #include "lib/retromain.h"
 #include "lib/retrobsp.h"
@@ -43,6 +43,7 @@ struct world_t
 	unsigned char lightTable[256 * 256];
 	int lightStyles[64];
 	double lightStyleTime = 0.0;
+	double skyTime = 0.0;
 	double textureTime = 0.0;
 };
 
@@ -56,6 +57,40 @@ unsigned char SurfaceColor(int surface)
 {
 	unsigned int hash = (unsigned int)surface * 1103515245u + 12345u;
 	return 32 + ((hash >> 8) & 0x7f);
+}
+
+// True if the texture name begins with "sky" (case-insensitive)
+bool IsSkyTextureName(const char *name)
+{
+	if (!name) {
+		return false;
+	}
+
+	char c0 = name[0];
+	char c1 = name[1];
+	char c2 = name[2];
+	if (c0 >= 'A' && c0 <= 'Z') c0 += 'a' - 'A';
+	if (c1 >= 'A' && c1 <= 'Z') c1 += 'a' - 'A';
+	if (c2 >= 'A' && c2 <= 'Z') c2 += 'a' - 'A';
+	return c0 == 's' && c1 == 'k' && c2 == 'y';
+}
+
+// True if the texture is a liquid (Quake names liquids "*...")
+bool IsTurbulentTextureName(const char *name)
+{
+	return name && name[0] == '*';
+}
+
+// Frame number 0-9 of a "+N..." animated texture, or -1 if it is not animated
+int TextureAnimationFrame(const char *name)
+{
+	if (!name || name[0] != '+') {
+		return -1;
+	}
+	if (name[1] >= '0' && name[1] <= '9') {
+		return name[1] - '0';
+	}
+	return -1;
 }
 
 // True if two "+" animated texture names belong to the same sequence
@@ -74,18 +109,6 @@ bool IsSameTextureAnimation(const char *a, const char *b)
 		}
 	}
 	return true;
-}
-
-// Frame number 0-9 of a "+N..." animated texture, or -1 if it is not animated
-int TextureAnimationFrame(const char *name)
-{
-	if (!name || name[0] != '+') {
-		return -1;
-	}
-	if (name[1] >= '0' && name[1] <= '9') {
-		return name[1] - '0';
-	}
-	return -1;
 }
 
 // Classic Quake light-style brightness patterns. Each character 'a'..'z' is a
@@ -457,7 +480,11 @@ void DrawSurface(world_t *world, int surface, const drawcontext_t *ctx)
 		current.t[1] = primitives[i].t[1];
 		current.l[0] = primitives[i].l[0];
 		current.l[1] = primitives[i].l[1];
-		DrawTriangle(ctx, first, previous, current, texture, lightmap, mipLevel, color);
+		if (texture && texture->isSky) {
+			DrawSkyTriangle(ctx, first, previous, current, texture);
+		} else {
+			DrawTriangle(ctx, first, previous, current, texture, lightmap, mipLevel, color);
+		}
 		previous = current;
 	}
 }
@@ -510,6 +537,7 @@ void DrawScene(world_t *world, RETRO_Camera *camera, unsigned char *framebuffer,
 {
 	world->framebuffer = framebuffer;
 	UpdateLightStyles(world, deltaTime);
+	world->skyTime += deltaTime;
 	world->textureTime += deltaTime;
 	ClearBuffers(world);
 
@@ -520,6 +548,17 @@ void DrawScene(world_t *world, RETRO_Camera *camera, unsigned char *framebuffer,
 	dleaf_t *leaf = FindLeaf(world, camera);
 
 	// Setup the drawing context
+	float skyStart[3];
+	float skyDx[3];
+	float skyDy[3];
+	float w_recip = (world->framebufferWidth > 1) ? (2.0f / (float)(world->framebufferWidth - 1)) : 0.0f;
+	float h_recip = (world->framebufferHeight > 1) ? (-2.0f * world->frustumRatio / (float)(world->framebufferHeight - 1)) : 0.0f;
+	for (int i = 0; i < 3; i++) {
+		skyStart[i] = world->viewForward[i] - world->viewSide[i] + world->frustumRatio * world->viewUp[i];
+		skyDx[i] = w_recip * world->viewSide[i];
+		skyDy[i] = h_recip * world->viewUp[i];
+	}
+
 	drawcontext_t ctx = {
 		world->framebuffer,
 		world->depthbuffer,
@@ -528,9 +567,9 @@ void DrawScene(world_t *world, RETRO_Camera *camera, unsigned char *framebuffer,
 		world->lightTable,
 		world->lightStyles,
 		world->textureTime,
-		{ 0.0f, 0.0f, 0.0f },
-		{ 0.0f, 0.0f, 0.0f },
-		{ 0.0f, 0.0f, 0.0f }
+		{ skyStart[0], skyStart[1], skyStart[2] },
+		{ skyDx[0], skyDx[1], skyDx[2] },
+		{ skyDy[0], skyDy[1], skyDy[2] }
 	};
 
 	// Render the scene
@@ -562,6 +601,8 @@ bool DecodeTextures(world_t *world)
 		if (!mipTexture || !mipTexture->name[0] || mipTexture->offsets[0] == 0) {
 			continue;
 		}
+		world->textures[i].isSky = IsSkyTextureName(mipTexture->name);
+		world->textures[i].isTurbulent = IsTurbulentTextureName(mipTexture->name);
 
 		int width = mipTexture->width;
 		int height = mipTexture->height;
