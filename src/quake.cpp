@@ -15,10 +15,18 @@
 
 #define MOVEMENT_SPEED		8.0
 
+// A surface queued for drawing this frame, with its front-to-back sort key
+struct visiblesurface_t
+{
+	int surface;		// surface (face) index
+	float distance;		// squared distance from the camera
+};
+
 struct world_t
 {
 	RETRO_BSP *map = NULL;
 	primdesc_t *surfacePrimitives = NULL;
+	visiblesurface_t *sortedVisibleSurfaces = NULL;
 	int numMaxEdgesPerSurface = 0;
 	int framebufferWidth = 0;
 	int framebufferHeight = 0;
@@ -143,6 +151,75 @@ dleaf_t *FindLeaf(world_t *world, RETRO_Camera *camera)
 }
 
 //
+// Check if the camera is on the drawable side of a BSP surface
+//
+bool IsSurfaceVisible(world_t *world, int surface)
+{
+	dface_t *bspSurface = world->map->getSurface(surface);
+	dplane_t *plane = world->map->getPlane(bspSurface->planenum);
+	float distance = DotProduct(plane->normal, world->viewOrigin) - plane->dist;
+
+	// side selects which half-space the face points into: the face normal equals the
+	// plane normal for side 0 and is reversed for side 1.
+	if (bspSurface->side) {
+		return distance <= 0.0f;
+	}
+	return distance >= 0.0f;
+}
+
+//
+// Calculate approximate front-to-back surface distance from the camera
+//
+float CalculateSurfaceDistance(world_t *world, int surface)
+{
+	// Squared distance from the camera to the face's first vertex - cheap, and good
+	// enough as a front-to-back sort key.
+	primdesc_t *primitives = &world->surfacePrimitives[world->numMaxEdgesPerSurface * surface];
+	vec3_t delta = {
+		primitives[0].v[0] - world->viewOrigin[0],
+		primitives[0].v[1] - world->viewOrigin[1],
+		primitives[0].v[2] - world->viewOrigin[2]
+	};
+	return DotProduct(delta, delta);
+}
+
+//
+// Gather the back-face-culled surfaces of one leaf into the visible surface list
+//
+void CollectLeafSurfaces(world_t *world, int leafIndex, int &numVisibleSurfaces)
+{
+	dleaf_t *leaf = world->map->getLeaf(leafIndex);
+	int firstSurface = leaf->firstmarksurface;
+	int lastSurface = firstSurface + leaf->nummarksurfaces;
+	int maxVisibleSurfaces = world->map->getNumSurfaceLists();
+	for (int k = firstSurface; k < lastSurface; k++) {
+		int surface = world->map->getSurfaceList(k);
+		if (numVisibleSurfaces < maxVisibleSurfaces && IsSurfaceVisible(world, surface)) {
+			world->sortedVisibleSurfaces[numVisibleSurfaces].surface = surface;
+			world->sortedVisibleSurfaces[numVisibleSurfaces].distance = CalculateSurfaceDistance(world, surface);
+			numVisibleSurfaces++;
+		}
+	}
+}
+
+//
+// Sort visible surfaces front-to-back
+//
+void SortVisibleSurfaces(visiblesurface_t *surfaces, int numSurfaces)
+{
+	// Insertion sort by distance, nearest first.
+	for (int i = 1; i < numSurfaces; i++) {
+		visiblesurface_t current = surfaces[i];
+		int j = i - 1;
+		while (j >= 0 && surfaces[j].distance > current.distance) {
+			surfaces[j + 1] = surfaces[j];
+			j--;
+		}
+		surfaces[j + 1] = current;
+	}
+}
+
+//
 // Draw the surface
 //
 void DrawSurface(world_t *world, int surface, const drawcontext_t *ctx)
@@ -171,6 +248,47 @@ void DrawSurface(world_t *world, int surface, const drawcontext_t *ctx)
 }
 
 //
+// Calculate which other leaves are visible from the specified leaf, fetch the associated surfaces and draw them
+//
+void DrawLeafVisibleSet(world_t *world, dleaf_t *pLeaf, const drawcontext_t *ctx)
+{
+	int numVisibleSurfaces = 0;
+	// Leaves are numbered 1..numLeaves; bit (i-1) of the PVS maps to leaf i.
+	int numLeaves = world->map->getNumLeaves();
+
+	if (pLeaf->visofs < 0) {
+		// No visibility information for this leaf: treat every leaf as potentially visible.
+		for (int i = 1; i <= numLeaves; i++) {
+			CollectLeafSurfaces(world, i, numVisibleSurfaces);
+		}
+	} else {
+		// Decompress the run-length encoded PVS. A zero byte means "skip the next
+		// (8 * following byte) leaves"; any other byte holds 8 visibility bits,
+		// least-significant bit first.
+		unsigned char *visibilityList = world->map->getVisibilityList(pLeaf->visofs);
+		for (int i = 1; i <= numLeaves; ) {
+			if (*visibilityList == 0) {
+				i += 8 * visibilityList[1];
+				visibilityList += 2;
+			} else {
+				for (int bit = 1; bit < 256 && i <= numLeaves; bit <<= 1, i++) {
+					if (*visibilityList & bit) {
+						CollectLeafSurfaces(world, i, numVisibleSurfaces);
+					}
+				}
+				visibilityList++;
+			}
+		}
+	}
+
+	// Draw the copied surfaces
+	SortVisibleSurfaces(world->sortedVisibleSurfaces, numVisibleSurfaces);
+	for (int i = 0; i < numVisibleSurfaces; i++) {
+		DrawSurface(world, world->sortedVisibleSurfaces[i].surface, ctx);
+	}
+}
+
+//
 // Draw the scene
 //
 void DrawScene(world_t *world, RETRO_Camera *camera, unsigned char *framebuffer, double deltaTime)
@@ -183,7 +301,6 @@ void DrawScene(world_t *world, RETRO_Camera *camera, unsigned char *framebuffer,
 
 	// Find the leaf the camera is in
 	dleaf_t *leaf = FindLeaf(world, camera);
-	(void)leaf;
 
 	// Setup the drawing context
 	drawcontext_t ctx = {
@@ -194,9 +311,7 @@ void DrawScene(world_t *world, RETRO_Camera *camera, unsigned char *framebuffer,
 	};
 
 	// Render the scene
-	for (int i = 0; i < world->map->getNumSurfaces(); i++) {
-		DrawSurface(world, i, &ctx);
-	}
+	DrawLeafVisibleSet(world, leaf, &ctx);
 }
 
 //
@@ -204,6 +319,9 @@ void DrawScene(world_t *world, RETRO_Camera *camera, unsigned char *framebuffer,
 //
 bool DecodeSurfaces(world_t *world)
 {
+	// Allocate memory for the sorted visible surfaces array
+	world->sortedVisibleSurfaces = new visiblesurface_t [world->map->getNumSurfaceLists()];
+
 	// Calculate max number of edges per surface
 	world->numMaxEdgesPerSurface = 0;
 	for (int i = 0; i < world->map->getNumSurfaces(); i++) {
@@ -280,6 +398,7 @@ void DEMO_Deinitialize(void)
 {
 	RETRO_FreeBSP(&map);
 	if (world.surfacePrimitives) delete[] world.surfacePrimitives;
+	if (world.sortedVisibleSurfaces) delete[] world.sortedVisibleSurfaces;
 	if (world.depthbuffer) delete[] world.depthbuffer;
 }
 
